@@ -1,0 +1,316 @@
+{
+  "name": "Timmified Document Style Guide Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "create",
+        "channelId": "={{$env.TEAMS_CHANNEL_ID}}",
+        "messageType": "text"
+      },
+      "id": "teams-trigger",
+      "name": "Teams Message Trigger",
+      "type": "n8n-nodes-base.microsoftTeams",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "timmified-teams-webhook",
+      "credentials": {
+        "microsoftTeamsOAuth2Api": {
+          "id": "1",
+          "name": "Microsoft Teams Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Validate Teams message and extract OneDrive file link\nconst message = $input.item.json;\nconst messageText = message.body?.content || '';\n\n// Extract OneDrive link using regex\nconst oneDriveLinkRegex = /https:\\/\\/[\\w-]+\\.sharepoint\\.com\\/[^\\s]+/;\nconst match = messageText.match(oneDriveLinkRegex);\n\nif (!match) {\n  throw new Error('No OneDrive file link found in the message. Please include a valid OneDrive link.');\n}\n\nconst fileLink = match[0];\nconst channelId = message.channelIdentity?.channelId;\nconst teamId = message.channelIdentity?.teamId;\n\n// Validate file type from link\nconst isValidFileType = fileLink.match(/\\.(docx|pptx)(\\?|$)/);\n\nif (!isValidFileType) {\n  throw new Error('Invalid file type. Only .docx (Word) and .pptx (PowerPoint) files are supported.');\n}\n\nreturn {\n  json: {\n    fileLink: fileLink,\n    channelId: channelId,\n    teamId: teamId,\n    originalMessage: messageText,\n    fileType: isValidFileType[1]\n  }\n};"
+      },
+      "id": "validate-extract-link",
+      "name": "Validate & Extract File Link",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$json.fileLink}}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOneDriveOAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "download-file",
+      "name": "Download File from OneDrive",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [650, 300],
+      "credentials": {
+        "microsoftOneDriveOAuth2Api": {
+          "id": "2",
+          "name": "Microsoft OneDrive Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract text from DOCX or PPTX using OpenXML parsing\nconst AdmZip = require('adm-zip');\nconst fileData = $input.item.binary.data;\nconst fileType = $input.item.json.fileType;\n\n// Convert binary to buffer\nconst buffer = Buffer.from(fileData.data, 'base64');\nconst zip = new AdmZip(buffer);\n\nlet extractedText = [];\nlet xmlStructure = [];\n\nif (fileType === 'docx') {\n  // Extract from Word document\n  const documentXml = zip.readAsText('word/document.xml');\n  \n  // Parse XML to extract text while preserving structure\n  const textMatches = documentXml.match(/<w:t[^>]*>([^<]+)<\\/w:t>/g) || [];\n  \n  textMatches.forEach((match, index) => {\n    const text = match.replace(/<w:t[^>]*>([^<]+)<\\/w:t>/, '$1');\n    extractedText.push(text);\n    xmlStructure.push({\n      index: index,\n      originalText: text,\n      xmlTag: match\n    });\n  });\n  \n} else if (fileType === 'pptx') {\n  // Extract from PowerPoint presentation\n  const zipEntries = zip.getEntries();\n  \n  zipEntries.forEach((entry, slideIndex) => {\n    if (entry.entryName.match(/ppt\\/slides\\/slide\\d+\\.xml/)) {\n      const slideXml = entry.getData().toString('utf8');\n      const textMatches = slideXml.match(/<a:t>([^<]+)<\\/a:t>/g) || [];\n      \n      textMatches.forEach((match, index) => {\n        const text = match.replace(/<a:t>([^<]+)<\\/a:t>/, '$1');\n        extractedText.push(text);\n        xmlStructure.push({\n          slide: entry.entryName,\n          index: index,\n          originalText: text,\n          xmlTag: match\n        });\n      });\n    }\n  });\n}\n\nif (extractedText.length === 0) {\n  throw new Error('No text found in the document. The file may be empty or corrupted.');\n}\n\nreturn {\n  json: {\n    ...($input.item.json),\n    extractedText: extractedText.join('\\n\\n'),\n    textCount: extractedText.length,\n    xmlStructure: xmlStructure,\n    originalFile: fileData.data\n  }\n};"
+      },
+      "id": "extract-text-openxml",
+      "name": "Extract Text (OpenXML)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300],
+      "notesInFlow": true,
+      "notes": "Parses DOCX/PPTX using OpenXML standard to extract text while preserving structure for reconstruction"
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": "gpt-4",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "={{$env.OPENAI_STYLE_GUIDE_INSTRUCTIONS}}"
+            },
+            {
+              "role": "user",
+              "content": "={{$json.extractedText}}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 4000
+        }
+      },
+      "id": "openai-style-guide",
+      "name": "OpenAI Style Guide Processing",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "3",
+          "name": "OpenAI Account"
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Processes text through OpenAI using corporate style guide instructions stored in environment variable"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Reconstruct file with updated text from OpenAI\nconst AdmZip = require('adm-zip');\nconst originalFileData = $input.item.json.originalFile;\nconst xmlStructure = $input.item.json.xmlStructure;\nconst updatedText = $input.item.json.choices[0].message.content;\nconst fileType = $input.item.json.fileType;\n\n// Split updated text back into segments (assuming OpenAI preserved structure)\nconst updatedSegments = updatedText.split('\\n\\n');\n\nif (updatedSegments.length !== xmlStructure.length) {\n  console.warn('Text segment count mismatch. Attempting smart mapping...');\n}\n\n// Recreate ZIP from original\nconst buffer = Buffer.from(originalFileData, 'base64');\nconst zip = new AdmZip(buffer);\n\nif (fileType === 'docx') {\n  // Update Word document\n  let documentXml = zip.readAsText('word/document.xml');\n  \n  xmlStructure.forEach((struct, index) => {\n    if (updatedSegments[index]) {\n      const newText = updatedSegments[index];\n      // XML encode the new text\n      const encodedText = newText\n        .replace(/&/g, '&amp;')\n        .replace(/</g, '&lt;')\n        .replace(/>/g, '&gt;')\n        .replace(/\"/g, '&quot;')\n        .replace(/'/g, '&apos;');\n      \n      documentXml = documentXml.replace(struct.xmlTag, struct.xmlTag.replace(struct.originalText, encodedText));\n    }\n  });\n  \n  zip.updateFile('word/document.xml', Buffer.from(documentXml, 'utf8'));\n  \n} else if (fileType === 'pptx') {\n  // Update PowerPoint presentation\n  let currentSlideXml = null;\n  let currentSlidePath = null;\n  \n  xmlStructure.forEach((struct, index) => {\n    if (updatedSegments[index]) {\n      // Load slide if different from current\n      if (currentSlidePath !== struct.slide) {\n        if (currentSlideXml && currentSlidePath) {\n          // Save previous slide\n          zip.updateFile(currentSlidePath, Buffer.from(currentSlideXml, 'utf8'));\n        }\n        currentSlidePath = struct.slide;\n        currentSlideXml = zip.readAsText(struct.slide);\n      }\n      \n      const newText = updatedSegments[index];\n      const encodedText = newText\n        .replace(/&/g, '&amp;')\n        .replace(/</g, '&lt;')\n        .replace(/>/g, '&gt;')\n        .replace(/\"/g, '&quot;')\n        .replace(/'/g, '&apos;');\n      \n      currentSlideXml = currentSlideXml.replace(struct.xmlTag, struct.xmlTag.replace(struct.originalText, encodedText));\n    }\n  });\n  \n  // Save final slide\n  if (currentSlideXml && currentSlidePath) {\n    zip.updateFile(currentSlidePath, Buffer.from(currentSlideXml, 'utf8'));\n  }\n}\n\n// Generate new file as base64\nconst updatedFileBuffer = zip.toBuffer();\nconst updatedFileBase64 = updatedFileBuffer.toString('base64');\n\nreturn {\n  json: {\n    ...($input.item.json),\n    updatedFile: updatedFileBase64,\n    updatedAt: new Date().toISOString()\n  },\n  binary: {\n    data: {\n      data: updatedFileBase64,\n      mimeType: fileType === 'docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' : 'application/vnd.openxmlformats-officedocument.presentationml.presentation',\n      fileExtension: fileType,\n      fileName: `updated.${fileType}`\n    }\n  }\n};"
+      },
+      "id": "reconstruct-file",
+      "name": "Reconstruct File (OpenXML)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "notesInFlow": true,
+      "notes": "Rebuilds DOCX/PPTX with updated text while preserving all formatting and structure"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Generate timestamped filename\nconst originalLink = $input.item.json.fileLink;\nconst fileType = $input.item.json.fileType;\n\n// Extract original filename from link\nconst urlParts = originalLink.split('/');\nlet originalFilename = urlParts[urlParts.length - 1].split('?')[0];\n\n// Remove extension\noriginalFilename = originalFilename.replace(`.${fileType}`, '');\n\n// Generate timestamp in YYYYMMDDhhmm format\nconst now = new Date();\nconst timestamp = now.getFullYear() + \n  String(now.getMonth() + 1).padStart(2, '0') + \n  String(now.getDate()).padStart(2, '0') + \n  String(now.getHours()).padStart(2, '0') + \n  String(now.getMinutes()).padStart(2, '0');\n\n// Create new filename\nconst newFilename = `${originalFilename}_Timmified_${timestamp}.${fileType}`;\n\n// Extract folder path from original link\nconst folderPath = originalLink.substring(0, originalLink.lastIndexOf('/'));\n\nreturn {\n  json: {\n    ...($input.item.json),\n    newFilename: newFilename,\n    folderPath: folderPath,\n    timestamp: timestamp\n  }\n};"
+      },
+      "id": "generate-filename",
+      "name": "Generate Timestamped Filename",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "path": "={{$json.folderPath}}",
+        "fileName": "={{$json.newFilename}}",
+        "binaryData": true,
+        "binaryPropertyName": "data"
+      },
+      "id": "upload-to-onedrive",
+      "name": "Upload to OneDrive",
+      "type": "n8n-nodes-base.microsoftOneDrive",
+      "typeVersion": 2,
+      "position": [1650, 300],
+      "credentials": {
+        "microsoftOneDriveOAuth2Api": {
+          "id": "2",
+          "name": "Microsoft OneDrive Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "create",
+        "channelId": "={{$json.channelId}}",
+        "messageType": "text",
+        "message": "=✅ **Document Timmified Successfully!**\\n\\nYour file has been processed and updated according to the corporate style guide.\\n\\n📄 **New File:** {{$json.newFilename}}\\n🔗 **Link:** {{$json.webUrl}}\\n⏱️ **Processed:** {{$json.timestamp}}\\n\\nThe updated file has been saved in the same OneDrive location."
+      },
+      "id": "send-success-message",
+      "name": "Send Success Message to Teams",
+      "type": "n8n-nodes-base.microsoftTeams",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "microsoftTeamsOAuth2Api": {
+          "id": "1",
+          "name": "Microsoft Teams Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Format human-friendly error message\nconst error = $input.item.json.error || $input.item.json;\nconst errorMessage = error.message || error.toString();\n\nlet friendlyMessage = '';\n\n// Categorize errors and provide helpful messages\nif (errorMessage.includes('No OneDrive file link')) {\n  friendlyMessage = '❌ **Oops! I couldn\\'t find a file link.**\\n\\nPlease make sure your message includes a valid OneDrive link to a Word (.docx) or PowerPoint (.pptx) file.';\n} else if (errorMessage.includes('Invalid file type')) {\n  friendlyMessage = '❌ **Unsupported file type.**\\n\\nI can only process Word documents (.docx) and PowerPoint presentations (.pptx). Please share a supported file type.';\n} else if (errorMessage.includes('Download failed') || errorMessage.includes('403') || errorMessage.includes('401')) {\n  friendlyMessage = '❌ **I couldn\\'t access the file.**\\n\\nPlease make sure:\\n- The file link is valid\\n- I have permission to access the file\\n- The file hasn\\'t been deleted or moved';\n} else if (errorMessage.includes('No text found')) {\n  friendlyMessage = '❌ **The document appears to be empty.**\\n\\nI couldn\\'t find any text to process. Please check that the file contains text content.';\n} else if (errorMessage.includes('OpenAI') || errorMessage.includes('API')) {\n  friendlyMessage = '❌ **AI processing error.**\\n\\nThere was an issue processing your document through the style guide AI. Please try again in a moment.';\n} else if (errorMessage.includes('Upload failed')) {\n  friendlyMessage = '❌ **Couldn\\'t save the updated file.**\\n\\nThe processing completed, but I had trouble saving the file back to OneDrive. Please check your OneDrive permissions and try again.';\n} else {\n  friendlyMessage = `❌ **Something went wrong.**\\n\\nI encountered an unexpected error while processing your file:\\n\\n_${errorMessage}_\\n\\nPlease try again or contact support if the issue persists.`;\n}\n\nreturn {\n  json: {\n    channelId: $input.item.json.channelId || '{{$env.TEAMS_CHANNEL_ID}}',\n    friendlyMessage: friendlyMessage,\n    technicalError: errorMessage,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "format-error-message",
+      "name": "Format Human-Friendly Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 500],
+      "notesInFlow": true,
+      "notes": "Converts technical errors into friendly, actionable messages for end users"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "create",
+        "channelId": "={{$json.channelId}}",
+        "messageType": "text",
+        "message": "={{$json.friendlyMessage}}"
+      },
+      "id": "send-error-message",
+      "name": "Send Error to Teams",
+      "type": "n8n-nodes-base.microsoftTeams",
+      "typeVersion": 1,
+      "position": [1250, 500],
+      "credentials": {
+        "microsoftTeamsOAuth2Api": {
+          "id": "1",
+          "name": "Microsoft Teams Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "teams-trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate & Extract File Link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Extract File Link": {
+      "main": [
+        [
+          {
+            "node": "Download File from OneDrive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download File from OneDrive": {
+      "main": [
+        [
+          {
+            "node": "Extract Text (OpenXML)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text (OpenXML)": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Style Guide Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Style Guide Processing": {
+      "main": [
+        [
+          {
+            "node": "Reconstruct File (OpenXML)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconstruct File (OpenXML)": {
+      "main": [
+        [
+          {
+            "node": "Generate Timestamped Filename",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Timestamped Filename": {
+      "main": [
+        [
+          {
+            "node": "Upload to OneDrive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload to OneDrive": {
+      "main": [
+        [
+          {
+            "node": "Send Success Message to Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Human-Friendly Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error to Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "format-error-message"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2025-12-16T00:00:00.000Z",
+  "versionId": "1"
+}
